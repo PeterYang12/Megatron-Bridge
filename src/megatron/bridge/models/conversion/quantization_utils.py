@@ -56,13 +56,31 @@ def is_float8_e8m0_dtype(dtype: torch.dtype) -> bool:
     return e8m0_dtype is not None and dtype == e8m0_dtype
 
 
-def scale_from_amax(amax: torch.Tensor, max_quantized_value: float, scale_dtype: torch.dtype) -> torch.Tensor:
-    """Build positive quantization scales in the same scale family as ``scale_dtype``."""
+def scale_from_amax(
+    amax: torch.Tensor, max_quantized_value: float, scale_dtype: torch.dtype, *, pow2: bool = False
+) -> torch.Tensor:
+    """Build positive quantization scales in the same scale family as ``scale_dtype``.
+
+    ``pow2`` rounds the scales up to powers of two even when ``scale_dtype`` is a float type:
+    checkpoints that declare ``scale_fmt: ue8m0`` (DeepSeek-V4) store power-of-two scales as
+    ``float32``, and inference kernels built for that grid expect it to be preserved.
+    """
     scale = torch.where(amax > 0, amax / max_quantized_value, torch.ones_like(amax))
-    if is_float8_e8m0_dtype(scale_dtype):
+    if pow2 or is_float8_e8m0_dtype(scale_dtype):
         scale = scale.clamp(min=2.0**-127, max=2.0**127)
         return torch.exp2(torch.ceil(torch.log2(scale)))
     return scale
+
+
+def is_power_of_two_scale(scale: torch.Tensor) -> bool:
+    """Whether every positive entry of ``scale`` is a power of two (a ue8m0 grid stored as float)."""
+    if not isinstance(scale, torch.Tensor) or scale.numel() == 0 or is_fp8_tensor(scale):
+        return False
+    values = scale.detach().to(torch.float32).flatten()
+    values = values[values > 0]
+    if values.numel() == 0:
+        return False
+    return bool(torch.all(torch.log2(values).frac() == 0))
 
 
 def dequantize_fp8_blockwise(
@@ -165,6 +183,7 @@ def _quantize_fp8_2d_blocks(
     *,
     name: str = "",
     block_size: int = FP8_BLOCK_SIZE,
+    pow2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows, cols = weight.shape
     scale_rows, scale_cols = source_scale.shape
@@ -186,7 +205,7 @@ def _quantize_fp8_2d_blocks(
         weight_f32 = F.pad(weight_f32, (0, pad_cols, 0, pad_rows))
 
     blocks = weight_f32.view(scale_rows, block_size, scale_cols, block_size).transpose(1, 2)
-    scale_f32 = scale_from_amax(blocks.abs().amax(dim=(-1, -2)), FP8_E4M3_MAX, source_scale.dtype)
+    scale_f32 = scale_from_amax(blocks.abs().amax(dim=(-1, -2)), FP8_E4M3_MAX, source_scale.dtype, pow2=pow2)
     q_blocks = (blocks / scale_f32[:, :, None, None]).to(torch.float8_e4m3fn)
     q_weight = q_blocks.transpose(1, 2).reshape(scale_rows * block_size, scale_cols * block_size)[:rows, :cols]
     return q_weight.contiguous(), scale_f32.to(dtype=source_scale.dtype)
@@ -197,6 +216,7 @@ def _quantize_fp8_per_row_tiles(
     source_scale: torch.Tensor,
     *,
     name: str = "",
+    pow2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows, cols = weight.shape
     scale_rows, scale_cols = source_scale.shape
@@ -209,7 +229,7 @@ def _quantize_fp8_per_row_tiles(
 
     tile_cols = cols // scale_cols
     grouped = weight.to(torch.float32).reshape(rows, scale_cols, tile_cols)
-    scale_f32 = scale_from_amax(grouped.abs().amax(dim=-1), FP8_E4M3_MAX, source_scale.dtype)
+    scale_f32 = scale_from_amax(grouped.abs().amax(dim=-1), FP8_E4M3_MAX, source_scale.dtype, pow2=pow2)
     q_weight = (grouped / scale_f32[:, :, None]).to(torch.float8_e4m3fn).reshape(rows, cols)
     return q_weight.contiguous(), scale_f32.to(dtype=source_scale.dtype)
 
@@ -220,13 +240,14 @@ def _quantize_fp8_1d_scale(
     *,
     name: str = "",
     block_size: int = FP8_BLOCK_SIZE,
+    pow2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows, _ = weight.shape
     scale_len = source_scale.numel()
     weight_f32 = weight.to(torch.float32)
 
     if scale_len == rows:
-        scale_f32 = scale_from_amax(weight_f32.abs().amax(dim=1), FP8_E4M3_MAX, source_scale.dtype)
+        scale_f32 = scale_from_amax(weight_f32.abs().amax(dim=1), FP8_E4M3_MAX, source_scale.dtype, pow2=pow2)
         q_weight = (weight_f32 / scale_f32[:, None]).to(torch.float8_e4m3fn)
         return q_weight.contiguous(), scale_f32.to(dtype=source_scale.dtype)
 
@@ -244,7 +265,9 @@ def _quantize_fp8_1d_scale(
         row_start = block_idx * block_size
         row_end = min(row_start + block_size, rows)
         block = weight_f32[row_start:row_end]
-        block_scale = scale_from_amax(block.abs().amax().reshape(()), FP8_E4M3_MAX, source_scale.dtype)
+        block_scale = scale_from_amax(
+            block.abs().amax().reshape(()), FP8_E4M3_MAX, source_scale.dtype, pow2=pow2
+        )
         q_weight[row_start:row_end] = (block / block_scale).to(torch.float8_e4m3fn)
         scale_f32[block_idx] = block_scale
     return q_weight.contiguous(), scale_f32.to(dtype=source_scale.dtype)
@@ -256,23 +279,32 @@ def quantize_fp8_e4m3fn_like_scale(
     *,
     name: str = "",
     block_size: int = FP8_BLOCK_SIZE,
+    pow2_scales: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a 2-D weight to FP8 E4M3 using ``source_scale`` geometry and dtype."""
+    """Quantize a 2-D weight to FP8 E4M3 using ``source_scale`` geometry, dtype and scale grid.
+
+    ``pow2_scales`` selects power-of-two output scales. ``None`` (default) preserves the grid of
+    ``source_scale``: a checkpoint whose scales are all powers of two (``scale_fmt: ue8m0``
+    stored as ``float32``) is re-quantized onto that grid, so an unchanged weight exports
+    bit-identically instead of landing on an ``amax / 448`` grid the source never used.
+    """
     if weight.ndim != 2:
         label = f" for {name!r}" if name else ""
         raise RuntimeError(f"FP8 quantized export expects a 2-D weight{label}, got {weight.ndim}D")
 
+    pow2 = is_power_of_two_scale(source_scale) if pow2_scales is None else bool(pow2_scales)
+
     if source_scale.ndim == 1:
-        return _quantize_fp8_1d_scale(weight, source_scale, name=name, block_size=block_size)
+        return _quantize_fp8_1d_scale(weight, source_scale, name=name, block_size=block_size, pow2=pow2)
 
     if source_scale.ndim != 2:
         label = f" for {name!r}" if name else ""
         raise RuntimeError(f"Unsupported FP8 scale rank{label}: scale={tuple(source_scale.shape)}")
 
     if source_scale.shape[0] == weight.shape[0]:
-        return _quantize_fp8_per_row_tiles(weight, source_scale, name=name)
+        return _quantize_fp8_per_row_tiles(weight, source_scale, name=name, pow2=pow2)
 
-    return _quantize_fp8_2d_blocks(weight, source_scale, name=name, block_size=block_size)
+    return _quantize_fp8_2d_blocks(weight, source_scale, name=name, block_size=block_size, pow2=pow2)
 
 
 def dequantize_mxfp4(
@@ -440,11 +472,13 @@ def requantize_hf_weight_scale_pairs(
     hf_state_dict: Mapping[str, torch.Tensor],
     *,
     use_mxfp4: Callable[[str, torch.Tensor, torch.Tensor], bool] | None = None,
+    pow2_scales: bool | None = None,
 ) -> dict[str, torch.Tensor]:
     """Recreate quantized HF ``*.weight``/``*.scale`` pairs using source scale layout.
 
     ``use_mxfp4`` lets model bridges opt specific parameters into packed MXFP4
-    output. Other scaled weights are emitted as FP8 E4M3.
+    output. Other scaled weights are emitted as FP8 E4M3 on the scale grid of the
+    source (``pow2_scales=None``, see :func:`quantize_fp8_e4m3fn_like_scale`).
     """
     result: dict[str, torch.Tensor] = {}
     for hf_param, weight in converted_weights_dict.items():
@@ -465,7 +499,9 @@ def requantize_hf_weight_scale_pairs(
         if use_mxfp4 is not None and use_mxfp4(hf_param, weight, source_scale):
             q_weight, q_scale = quantize_mxfp4_e2m1_like_scale(weight, source_scale, name=hf_param)
         else:
-            q_weight, q_scale = quantize_fp8_e4m3fn_like_scale(weight, source_scale, name=hf_param)
+            q_weight, q_scale = quantize_fp8_e4m3fn_like_scale(
+                weight, source_scale, name=hf_param, pow2_scales=pow2_scales
+            )
 
         result[hf_param] = q_weight
         result[scale_key] = q_scale
